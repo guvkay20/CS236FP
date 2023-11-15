@@ -1,0 +1,21 @@
+name: CS236FP
+channels:
+    - pytorch
+    - pyg
+    - anaconda
+    - conda-forge
+dependencies:
+    - python >= 3.0
+    - pytorch
+    - pyg
+    - pandas
+    - git
+    - numpy
+    - scipy
+    - scikit-learn
+    - tensorboard
+    - biopython
+    - pip
+    - biopython
+    pip:
+        - rna-tools
