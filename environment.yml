@@ -19,3 +19,5 @@ dependencies:
     - biopython
     pip:
         - rna-tools
+        - rmsd
+        - packaging

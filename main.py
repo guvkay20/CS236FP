@@ -9,6 +9,9 @@ import os
 import copy
 import random
 import pickle
+from torch.utils import tensorboard
+#import tensorboard
+import rmsd
 
 random.seed(34)
 torch.manual_seed(34)
@@ -50,6 +53,9 @@ class MolGraph():
                 except:
                     return False
         self.coords = torch.stack(self.coords, dim=0)
+
+        if len(self.atoms)>=10000:
+            return False
 
         atoms_by_res = [dict() for _ in range(len(seq))] # Do go from atom numbs 1-indexed to 0-indexed 
         for i in range(len(seq)):
@@ -194,10 +200,10 @@ def getloss(model, batch, device):
 
     losses = list()
     for molgraph in molgraphs:
-        losses.append(
-            model.computeDiffuserLoss(molgraph)
-        ) 
+        mg_loss =  model.computeDiffuserLoss(molgraph)
+        losses.append(mg_loss)
     loss = torch.mean(torch.stack(losses))
+
     return loss
 
 
@@ -209,12 +215,24 @@ def loadRNA(pdbPath):
     seq = seq.split("\n")[-1] 
     return seq, lines, rnas
 
+def RMSD(coords1, coords2): # [num_atoms, 3] for each w same num_atoms
+    c1 = coords1.numpy(force=True)
+    c2 = coords2.numpy(force=True)
+    
+    c1 -= c1.centroid(c1)
+    c2 -= c2.centroid(c2)
+
+    U = rmsd.kabsch(c1,c2)
+    c1 = np.dot(c1, U)
+
+    return rmsd.rmsd(c1,c2)
+
 
 def predictCoords(model, molGraph):
     coordsMatrix = model.generateCoords(molGraph)
     return coordMatrix
 
-def validate(model, validation_dataset, use_ratio, batch_size, device):
+def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, RMSD = False, log=True): # If log, specify st
     dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
     goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
 
@@ -222,17 +240,50 @@ def validate(model, validation_dataset, use_ratio, batch_size, device):
     with torch.no_grad():
 
         losses = []
-        for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating', total=goFor)):
+        for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating', total=goFor)): # TODO averaging is slightly skewed on last iter
             if batch_no == goFor:
                 break
            
             loss = getloss(model, batch, device)
+
             losses.append(loss)
 
-        avg_loss = sum(losses)/len(losses)
-        print("Average Validation Loss", avg_loss)
-        # TODO RMSD support 
 
+        avg_loss = sum(losses)/len(losses)
+
+        
+
+        #avg_rmsd = sum(rmsds)/len(rmsds)
+
+        if log:
+            if use_ratio < 1.0:
+                sw.add_scalar('loss/intravalid',avg_loss,st)
+            else:
+                sw.add_scalar('loss/intervalid',avg_loss,st)
+            print("Average Validation Loss", avg_loss.item())
+       
+        if RMSD: # TODO verify functionality
+            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=True, collate_fn=lambda x:x)
+            rmsds = []
+            for batch_no, batch in enumerate(tqdm(rmsdDL, desc='Validating RMSD', total=goFor)):
+                if batch_no == goFor:
+                    break
+                
+                (x,y,z) = batch[0]
+                y = y.to(device)
+                z = z.to(device)
+                X = MolGraph()
+                X.atoms = x
+                X.adjList = z
+                X.coords = y
+                X.generateIndices()
+
+                coords_hat = predictCoords(model, X)
+                _rmsd = RMSD(coords_hat, y)
+                rmsds.append(_rmsd)
+            avg_rmsd = sum(rmsds)/len(rmsds) 
+            print("Average Validation RMSD", avg_rmsd)
+        
     model.train()
         
 def test(model, test_dataset, batch_size, device):
@@ -245,6 +296,7 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
     
     trainCode = random.randint(100000,999999)
     print("Training Code", trainCode)
+    sw = tensorboard.SummaryWriter(log_dir="logs/"+str(trainCode)+"/")
 
     model.to(device)
     def initer(m):
@@ -268,16 +320,17 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
             optimizer.zero_grad()
 
             loss = getloss(model, batch, device)
+            sw.add_scalar("loss/train",loss.item(),batch_no)
             loss.backward()
             optimizer.step()
 
-            if batch_no % 20 == 0:
+            if (batch_no*batch_size) % 80 < batch_size:
                 print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
-                validate(model, validation_dataset, 0.2, batch_size, device)
+                validate(model, validation_dataset, 0.2, batch_size, device, sw,batch_no+epoch*len(training_dataset))
 
         
         print("End of Epoch",epoch,"\n")    
-        validate(model, validation_dataset, 1.0, batch_size, device)
+        validate(model, validation_dataset, 1.0, batch_size, device, sw, epoch)
 
         torch.save(model.state_dict(),
             "checkpoints/train_endEpoch_"+str(trainCode)+"_epoch"+str(epoch)
@@ -287,6 +340,46 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
     )
 
 
+class Stat():
+    def __init__(self, name, fxn):
+        self.name = name
+        self.apply = fxn
+
+
+def DSstat(train, valid, test):
+    stats = []
+
+    stats.append(Stat("Len",lambda ds: len(ds)))
+
+    def distribution(ds):
+        numBucks = 100
+        dt = [0 for _ in range(numBucks)]
+        for item in ds:
+            try:
+                dt[int(len(item[0])/100)] += 1
+            except:
+                print("Overlong Seq Detected, Length:", len(item[0]))
+                #raise Exception
+        res = [(i*100,(i+1)*100-1,dt[i]) for i in range(numBucks)]
+        res = [str(it) for it in res]
+        return " ".join(res)
+    stats.append(Stat("Distribution",distribution))
+
+    for stat in stats:
+        print("Train " + stat.name + ": " + str(stat.apply(train)))
+        print("Validation " + stat.name + ": " + str(stat.apply(valid)))
+        print("Test " + stat.name + ": " + str(stat.apply(test)))
+
+
+
+
+# Modes:
+#   train: Trains Model, requires prepped DSs
+#   validate: Runs validation (Loss + RMSD) on ValidDS, requires prepped DSs and trained model
+#   test: Runs validation (Loss + RMSD) on TestDS, requires prepped DSs and trained model
+#   make_dataset: Prepares 3-split DSs, requires PDBs in a folder, outputs joint DSs there
+#   dataset_stat: Reports statistics for dataset; presently their length and atom-counts' distribution
+#
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("mode")
@@ -307,6 +400,10 @@ if __name__ == "__main__":
     
     trainDS, validDS, testDS = pickle.load(open(args.dataset_folder+"/DSs.pkl","rb"))
 
+    if args.mode=="dataset_stat":
+        DSstat(trainDS, validDS, testDS)
+        quit()
+    
     model = RNADiffuser()
     loaded = False
     if args.model_path is not None:
@@ -316,11 +413,13 @@ if __name__ == "__main__":
     
     if args.mode=="train":
         
-        train(model, trainDS, validDS, device, 4, 100, loaded)
+        train(model, trainDS, validDS, device, 1, 100, loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
+    elif args.mode=="validate":
+        validate(model, validDS, 1.0, 1, device, RMSD = True, log=False)
+    elif args.mode=="test":
+        print("Testing not implemented")
+        raise Exception
     else:
         print("ERROR: Mode argument not found in options")
         assert(False)
 
-    
-
-# TODO RSMD computer, tensorboard?
