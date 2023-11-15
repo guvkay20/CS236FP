@@ -12,9 +12,10 @@ import pickle
 from torch.utils import tensorboard
 #import tensorboard
 import rmsd
+import numpy as np
 
-random.seed(34)
-torch.manual_seed(34)
+#random.seed(34)
+#torch.manual_seed(34)
 
 class MolGraph():
     def __init__(self):
@@ -22,6 +23,8 @@ class MolGraph():
         self.adjList = None # Tensor of [numedges,2]
         self.coords = None # Tensor of  [numnodes,3]
         self.indices = None # Duple of 1D Tensors
+        self.nbs = None
+        self.nbe = None
 
     def readFromPDB(self, pdbPath): # Needs Coords
         print(pdbPath)
@@ -142,10 +145,10 @@ class MolGraph():
             for i in range(len(self.atoms)):
                 neighsOfI = list(self.adjList[self.adjList[:,0]==i,1])
                 neighsBySource.extend(neighsOfI)
-                numNeighbsBySource.append(len(neighsOfI))
+                numNeighsBySource.append(len(neighsOfI))
             neighsBySource
             self.nbs = (neighsBySource, numNeighsBySource)
-        return self.nbs[0], self.nbs[1]
+        return torch.tensor(self.nbs[0]), torch.tensor(self.nbs[1])
 
     def getNeighborsByEnd(self):  # (neigh,.)
         if self.nbe is None:
@@ -154,9 +157,9 @@ class MolGraph():
             for i in range(len(self.atoms)):
                 neighsOfI = list(self.adjList[self.adjList[:,1]==i,0])
                 neighsByEnd.extend(neighsOfI)
-                numNeighbsByEnd.append(len(neighsOfI))
+                numNeighsByEnd.append(len(neighsOfI))
             self.nbe = (neighsByEnd, numNeighsByEnd)
-        return self.nbe[0], self.nbe[1]
+        return torch.tensor(self.nbe[0]), torch.tensor(self.nbe[1])
 
 class MGDS(torch.utils.data.Dataset): # MolGraphDataSet
     def __init__(self, pdbPathsList):
@@ -185,6 +188,18 @@ def makeDSs(datafolder, device, cutoffs):  # device is relic, unused
     test = MGDS(pdbs[c1:])
 
     return train, valid, test
+
+def recon(a, device):
+    x,y,z = a
+    y = y.to(device)
+    z = z.to(device)
+    X = MolGraph()
+    X.atoms = x
+    X.adjList = z
+    X.coords = y
+    X.generateIndices()
+    return X
+ 
 
 def getloss(model, batch, device):
     molgraphs = list()
@@ -219,8 +234,8 @@ def RMSD(coords1, coords2): # [num_atoms, 3] for each w same num_atoms
     c1 = coords1.numpy(force=True)
     c2 = coords2.numpy(force=True)
     
-    c1 -= c1.centroid(c1)
-    c2 -= c2.centroid(c2)
+    c1 -= rmsd.centroid(c1)
+    c2 -= rmsd.centroid(c2)
 
     U = rmsd.kabsch(c1,c2)
     c1 = np.dot(c1, U)
@@ -228,11 +243,12 @@ def RMSD(coords1, coords2): # [num_atoms, 3] for each w same num_atoms
     return rmsd.rmsd(c1,c2)
 
 
-def predictCoords(model, molGraph):
-    coordsMatrix = model.generateCoords(molGraph)
-    return coordMatrix
+def predictCoords(model, molGraph, stepsAtNL=None):
+    with torch.no_grad():
+        coordsMatrix = model.generateCoords(molGraph) if stepsAtNL is None else model.generateCoords(molGraph, stepsAtNL)
+    return coordsMatrix
 
-def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, RMSD = False, log=True): # If log, specify st
+def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
     dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
     goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
 
@@ -262,10 +278,11 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 sw.add_scalar('loss/intervalid',avg_loss,st)
             print("Average Validation Loss", avg_loss.item())
        
-        if RMSD: # TODO verify functionality
+        if useRMSD: # TODO verify functionality
             rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=True, collate_fn=lambda x:x)
             rmsds = []
-            for batch_no, batch in enumerate(tqdm(rmsdDL, desc='Validating RMSD', total=goFor)):
+            _rmsd = "N/A"
+            for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}", total=goFor)):
                 if batch_no == goFor:
                     break
                 
@@ -278,9 +295,10 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 X.coords = y
                 X.generateIndices()
 
-                coords_hat = predictCoords(model, X)
+                coords_hat = predictCoords(model, X, pred_stepsAtNL)
                 _rmsd = RMSD(coords_hat, y)
                 rmsds.append(_rmsd)
+            print(rsmds)
             avg_rmsd = sum(rmsds)/len(rmsds) 
             print("Average Validation RMSD", avg_rmsd)
         
@@ -320,13 +338,13 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
             optimizer.zero_grad()
 
             loss = getloss(model, batch, device)
-            sw.add_scalar("loss/train",loss.item(),batch_no)
+            sw.add_scalar("loss/train",loss.item(),batch_no*batch_size+epoch*len(training_dataset))
             loss.backward()
             optimizer.step()
 
             if (batch_no*batch_size) % 80 < batch_size:
                 print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
-                validate(model, validation_dataset, 0.2, batch_size, device, sw,batch_no+epoch*len(training_dataset))
+                validate(model, validation_dataset, 0.2, batch_size, device, sw,batch_no*batch_size+epoch*len(training_dataset))
 
         
         print("End of Epoch",epoch,"\n")    
@@ -408,14 +426,17 @@ if __name__ == "__main__":
     loaded = False
     if args.model_path is not None:
         loaded = True
-        model = model.load_state_dict(torch.load(args.model_path))
+        model.load_state_dict(torch.load(args.model_path))
 
     
     if args.mode=="train":
         
         train(model, trainDS, validDS, device, 1, 100, loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
     elif args.mode=="validate":
-        validate(model, validDS, 1.0, 1, device, RMSD = True, log=False)
+        validate(model, validDS, 0.1, 1, device, useRMSD = True, log=False, pred_stepsAtNL = 10) # TODO 0.1 is a joke but required for rmsd realistic runtime
+    elif args.mode=="predict":
+        #print("RMSD",RMSD(predictCoords(model, recon(validDS[0], device), 1), validDS[0][1]))       # Currently set to debug prediction, TODO include sequence reconstruction
+        print("RMSD",RMSD(torch.randn_like(validDS[0][1]), validDS[0][1]))
     elif args.mode=="test":
         print("Testing not implemented")
         raise Exception

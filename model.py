@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch_geometric as pyg
 import math
 import random
+from tqdm import tqdm
 #from main import molGraph
 
 # SEQ -> NOISE -> STRUCTURE
@@ -152,42 +153,50 @@ class RNADiffuser(nn.Module):
         # molGraph format:
         #    molGraph.atoms -> List of Atom Types, indices are indices
         #    molGraph.adjList -> List of connections
-        
+
         molGraph.generateIndices()
+        sourceds, sourceds_lens = molGraph.getNeighborsBySource() # These don't get inverted
+        enders, enders_lens = molGraph.getNeighborsByEnd() # These get inverted
+        psums_sl = torch.cat([torch.tensor([0]),torch.cumsum(sourceds_lens,0) ], dim=0)
+        psums_el = torch.cat([torch.tensor([0]),torch.cumsum(enders_lens,0) ], dim=0)
+
         R = torch.normal(torch.zeros((len(molGraph.atoms),3)), 10)
-        for noise_level in self.noiseLevels:
-            step_size = self.baseStepSize * (noise_level**2) / (self.noiseLevels[-1]**2)
-            for t in range(stepsAtNL):
-                d = computeDVector(R, molGraph.indices) 
+        iters = 0
+        with tqdm(total=len(self.noiseLevels)*stepsAtNL, desc=f"Generating Molecule Structure") as pbar:
+            print("Noise Levels", self.noiseLevels)
+            for noise_level in self.noiseLevels:
+                print("Current Noise Level:", noise_level)
+                step_size = self.baseStepSize * (noise_level**2) / (self.noiseLevels[-1]**2)
+                for t in range(stepsAtNL):
+                    pbar.update(1)
+                    d = self.computeDVector(R, molGraph.indices) 
+                    
+                    scores = self.forward(molGraph, d)
+                    normscores = scores / d
+                    
+                    deltaRs = self.pairwiseDisplacements(R, molGraph.indices) 
+                    fixscores = (deltaRs.T * normscores).T
+                    # fixscores in raster order
+                    # NOTE fixscores is (i-j), where i is source node and j are neighbors
+                    
+                    # compute s by gathering for each index s the fixscores for those connected to s and summing them and negating them where needed
                 
-                scores = self.forward(molGraph, d)
-                normscores = scores / d
-                
-                deltaRs = self.pairwiseDisplacements(R, molGraph.indices) 
-                fixscores = deltaRs * normscores
-                # fixscores in raster order
-                # NOTE fixscores is (i-j), where i is source node and j are neighbors
-                
-                # compute s by gathering for each index s the fixscores for those connected to s and summing them and negating them where needed
-                sourceds, sourceds_lens = molGraph.getNeighborsBySource() # These don't get inverted
-                enders, enders_lens = molGraph.getNeighborsByEnd() # These get inverted
-                
-                sourced_scores = torch.index_select(fixscores, 0, sourceds)
-                ender_scores = torch.index_select(fixscores, 0, enders) * -1
-                
-                ss = list()
-                for i in range(len(sourceds_lens)):
-                    ss.append(
-                            torch.sum(sourced_scores[sum(sourceds_lens[:i]) : sum(sourceds_lens[:i+1]), :], dim=0) 
-                            +
-                            torch.sum(ender_scores[sum(enders_lens[:i]) : sum(enders_lens[:i+1]), :], dim=0) 
-                            )
-                s = torch.stack(ss, dim=0)
+                    sourced_scores = torch.index_select(fixscores, 0, sourceds)
+                    ender_scores = torch.index_select(fixscores, 0, enders) * -1
+                    
+                    ss = list()
+                    for i in range(len(sourceds_lens)):
+                        ss.append(
+                                torch.sum(sourced_scores[psums_sl[i] : psums_sl[i+1], :], dim=0) #torch.sum(sourced_scores[sum(sourceds_lens[:i]) : sum(sourceds_lens[:i+1]), :], dim=0) 
+                                +
+                                torch.sum(ender_scores[psums_el[i] : psums_el[i+1], :], dim=0)#torch.sum(ender_scores[sum(enders_lens[:i]) : sum(enders_lens[:i+1]), :], dim=0) 
+                        )
+                    s = torch.stack(ss, dim=0)
             
 
-                # Compute s theta
-                z = torch.normal(torch.zeros((1)),torch.ones((1)))
-                R = R + step_size * s + z * math.sqrt(2 * step_size)
+                    # Compute s theta
+                    z = torch.normal(torch.zeros((1)),torch.ones((1)))
+                    R = R + step_size * s + z * math.sqrt(2 * step_size)
         return R
 
     def pairwiseDisplacements(self, coords, indices): # raster order elemwise deltas
