@@ -296,9 +296,12 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 X.generateIndices()
 
                 coords_hat = predictCoords(model, X, pred_stepsAtNL)
+                X.predCoords = coords_hat
+                torch.save(X, "predictions/predicted_structure_"+str(random.randint(10000000,99999999)))
                 _rmsd = RMSD(coords_hat, y)
                 rmsds.append(_rmsd)
-            print(rsmds)
+                print(_rmsd)
+            print(rmsds)
             avg_rmsd = sum(rmsds)/len(rmsds) 
             print("Average Validation RMSD", avg_rmsd)
         

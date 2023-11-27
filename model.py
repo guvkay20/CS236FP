@@ -163,9 +163,9 @@ class RNADiffuser(nn.Module):
         R = torch.normal(torch.zeros((len(molGraph.atoms),3)), 10)
         iters = 0
         with tqdm(total=len(self.noiseLevels)*stepsAtNL, desc=f"Generating Molecule Structure") as pbar:
-            print("Noise Levels", self.noiseLevels)
+            #print("Noise Levels", self.noiseLevels)
             for noise_level in self.noiseLevels:
-                print("Current Noise Level:", noise_level)
+                #print("Current Noise Level:", noise_level)
                 step_size = self.baseStepSize * (noise_level**2) / (self.noiseLevels[-1]**2)
                 for t in range(stepsAtNL):
                     pbar.update(1)
@@ -191,7 +191,7 @@ class RNADiffuser(nn.Module):
                                 +
                                 torch.sum(ender_scores[psums_el[i] : psums_el[i+1], :], dim=0)#torch.sum(ender_scores[sum(enders_lens[:i]) : sum(enders_lens[:i+1]), :], dim=0) 
                         )
-                    s = torch.stack(ss, dim=0)
+                    s = torch.stack(ss, dim=0) /noise_level
             
 
                     # Compute s theta
