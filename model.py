@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_geometric as pyg
 import math
 import random
@@ -39,7 +40,7 @@ class MGINConv(pyg.nn.MessagePassing):
         indices = ((b-1)+a * (num_nodes - (a * 0.5) - 1.5)).to(torch.int64).reshape((-1))
         existing_edge_embeds = torch.index_select(edge_embeds,0,indices)
 
-        return x_j + existing_edge_embeds
+        return F.relu(x_j + existing_edge_embeds)
     #def aggregate(inputs, index)
 
 
@@ -59,7 +60,7 @@ class RNADiffuser(nn.Module):
         
         self.embedMap = dict()
         self.nodeEmbedder = nn.Embedding(100, 3)
-        self.edgeEmbedder = nn.Linear(3, 3)
+        self.edgeEmbedder = nn.Linear(4, 3)
         self.edgeNetwork = ModifiedGIN(3,10)
         self.finalEmbedder = nn.Sequential(
                 nn.Linear(9,9),
@@ -105,14 +106,15 @@ class RNADiffuser(nn.Module):
         node_embeds = self.nodeEmbedder(tokAtoms)
 
         # embed each edge in adjlist using predicted dist; use a MLP???
-        edge_embeds = self.edgeEmbedder(torch.stack([d_sim, torch.sqrt(torch.abs(d_sim)), torch.pow(d_sim, 2)], dim=1))
+        edge_exists = 1 * molGraph.desparseEdges()
+        edge_embeds = self.edgeEmbedder(torch.stack([edge_exists, d_sim, torch.sqrt(torch.abs(d_sim)), torch.pow(d_sim, 2)], dim=1))
 
         # standard message passing network with sum as agg basis, and embeds of edge and neighbor added for each message, self-con included; message computed directly, aggregate subject to MLP
         final_node_embeds = self.edgeNetwork(node_embeds, edge_embeds, molGraph.adjList)
 
         # after network, concat source || neighbor || edge embeds, use final to the nodes; subject to MLP, get edge scores in 3D
-        LHS = torch.index_select(node_embeds, 0, torch.tensor(molGraph.indices[0]))# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
-        RHS = torch.index_select(node_embeds, 0, torch.tensor(molGraph.indices[1]))#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
+        LHS = torch.index_select(final_node_embeds, 0, torch.tensor(molGraph.indices[0]))# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
+        RHS = torch.index_select(final_node_embeds, 0, torch.tensor(molGraph.indices[1]))#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
         
         concat_embeds = torch.cat((LHS,RHS,edge_embeds),dim=1)
         scores = self.finalEmbedder(concat_embeds)
@@ -132,7 +134,7 @@ class RNADiffuser(nn.Module):
         #losses = list()
 
         #for noise_level in noiseLevels:
-        #with random.choice(self.noiseLevels) as noise_level:  # TODO noise level as input to score fxn
+        #with random.choice(self.noiseLevels) as noise_level:  # TODO noise level as input to score fxn; maybe not
         noise_level = random.choice(self.noiseLevels)
     
         with torch.no_grad():

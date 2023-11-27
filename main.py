@@ -2,6 +2,7 @@ import rna_tools
 import rna_tools.rna_tools_lib as rtl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 import argparse
 from model import RNADiffuser
@@ -135,6 +136,16 @@ class MolGraph():
                 self.indices[0].extend([i] * (len(self.atoms)-1-i))
                 self.indices[1].extend(list(range(i+1,len(self.atoms))))
 
+    def desparseEdges(self): # Note must have indices and self.adjList
+        des = torch.zeros(len(self.indices[0]), dtype=torch.bool)
+        lowerIndex = torch.min(self.adjList, dim=1).values
+        higherIndex = torch.max(self.adjList, dim=1).values
+        indexOffset = higherIndex - lowerIndex - 1
+        indexBase =  len(self.atoms) * lowerIndex - (torch.pow(lowerIndex,2) + lowerIndex) / 2    #z -> zn - (z**2 + z) /2
+        index = indexBase + indexOffset
+        des[index.to(torch.int64)] = True
+        return des
+        
     def makeFromSeq(self, seq): # TODO, generate atoms and adjlist
         pass
 
@@ -278,7 +289,7 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 sw.add_scalar('loss/intervalid',avg_loss,st)
             print("Average Validation Loss", avg_loss.item())
        
-        if useRMSD: # TODO verify functionality
+        if useRMSD: #
             rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=True, collate_fn=lambda x:x)
             rmsds = []
             _rmsd = "N/A"
@@ -286,21 +297,21 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 if batch_no == goFor:
                     break
                 
-                (x,y,z) = batch[0]
-                y = y.to(device)
-                z = z.to(device)
-                X = MolGraph()
-                X.atoms = x
-                X.adjList = z
-                X.coords = y
-                X.generateIndices()
+                for (x,y,z) in batch:
+                    y = y.to(device)
+                    z = z.to(device)
+                    X = MolGraph()
+                    X.atoms = x
+                    X.adjList = z
+                    X.coords = y
+                    X.generateIndices()
 
-                coords_hat = predictCoords(model, X, pred_stepsAtNL)
-                X.predCoords = coords_hat
-                torch.save(X, "predictions/predicted_structure_"+str(random.randint(10000000,99999999)))
-                _rmsd = RMSD(coords_hat, y)
-                rmsds.append(_rmsd)
-                print(_rmsd)
+                    coords_hat = predictCoords(model, X, pred_stepsAtNL)
+                    X.predCoords = coords_hat
+                    torch.save(X, "predictions/predicted_structure_"+str(random.randint(10000000,99999999)))
+                    _rmsd = RMSD(coords_hat, y)
+                    rmsds.append(_rmsd)
+                    print(_rmsd)
             print(rmsds)
             avg_rmsd = sum(rmsds)/len(rmsds) 
             print("Average Validation RMSD", avg_rmsd)
@@ -404,9 +415,9 @@ def DSstat(train, valid, test):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("mode")
-    parser.add_argument("-d", "--dataset_folder")
-    parser.add_argument("-v", "--device")
-    parser.add_argument("-m", "--model_path")
+    parser.add_argument("-d", "--dataset_folder", default="data/")
+    parser.add_argument("-v", "--device", default=None)
+    parser.add_argument("-m", "--model_path", default=None)
     args = parser.parse_args()
 
     if args.device is not None:
