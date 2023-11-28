@@ -14,6 +14,7 @@ from torch.utils import tensorboard
 #import tensorboard
 import rmsd
 import numpy as np
+import pdb
 
 #random.seed(34)
 #torch.manual_seed(34)
@@ -224,11 +225,12 @@ def getloss(model, batch, device):
         X.generateIndices()
         molgraphs.append(X)        
 
-    losses = list()
-    for molgraph in molgraphs:
-        mg_loss =  model.computeDiffuserLoss(molgraph)
-        losses.append(mg_loss)
-    loss = torch.mean(torch.stack(losses))
+    #losses = list()
+    #for molgraph in molgraphs:
+    #    mg_loss =  model.computeDiffuserLoss(molgraph)
+    #    losses.append(mg_loss)
+    #loss = torch.mean(torch.stack(losses))
+    loss = torch.mean(model.computeDiffuserLoss(molgraphs))
 
     return loss
 
@@ -254,10 +256,10 @@ def RMSD(coords1, coords2): # [num_atoms, 3] for each w same num_atoms
     return rmsd.rmsd(c1,c2)
 
 
-def predictCoords(model, molGraph, stepsAtNL=None):
+def predictCoords(model, molGraphs, stepsAtNL=None):
     with torch.no_grad():
-        coordsMatrix = model.generateCoords(molGraph) if stepsAtNL is None else model.generateCoords(molGraph, stepsAtNL)
-    return coordsMatrix
+        coordsMatrices = model.generateCoords(molGraphs) if stepsAtNL is None else model.generateCoords(molGraphs, stepsAtNL)
+    return coordsMatrices
 
 def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
     dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
@@ -290,13 +292,14 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
             print("Average Validation Loss", avg_loss.item())
        
         if useRMSD: #
-            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=True, collate_fn=lambda x:x)
+            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=2, shuffle=True, collate_fn=lambda x:x)
             rmsds = []
             _rmsd = "N/A"
             for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}", total=goFor)):
                 if batch_no == goFor:
                     break
                 
+                Xs = list()
                 for (x,y,z) in batch:
                     y = y.to(device)
                     z = z.to(device)
@@ -305,11 +308,13 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                     X.adjList = z
                     X.coords = y
                     X.generateIndices()
+                    Xs.append(X)
 
-                    coords_hat = predictCoords(model, X, pred_stepsAtNL)
-                    X.predCoords = coords_hat
+                coords_hats = predictCoords(model, Xs, pred_stepsAtNL)
+                for X, coord_hat in zip(Xs, coords_hats):
+                    X.predCoords = coord_hat
                     torch.save(X, "predictions/predicted_structure_"+str(random.randint(10000000,99999999)))
-                    _rmsd = RMSD(coords_hat, y)
+                    _rmsd = RMSD(coord_hat, X.coords)
                     rmsds.append(_rmsd)
                     print(_rmsd)
             print(rmsds)
@@ -445,9 +450,9 @@ if __name__ == "__main__":
     
     if args.mode=="train":
         
-        train(model, trainDS, validDS, device, 1, 100, loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
+        train(model, trainDS, validDS, device, 2, 100, loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
     elif args.mode=="validate":
-        validate(model, validDS, 0.1, 1, device, useRMSD = True, log=False, pred_stepsAtNL = 10) # TODO 0.1 is a joke but required for rmsd realistic runtime
+        validate(model, validDS, 0.1, 2, device, useRMSD = True, log=False, pred_stepsAtNL = 1) # TODO 0.1 is a joke but required for rmsd realistic runtime
     elif args.mode=="predict":
         #print("RMSD",RMSD(predictCoords(model, recon(validDS[0], device), 1), validDS[0][1]))       # Currently set to debug prediction, TODO include sequence reconstruction
         print("RMSD",RMSD(torch.randn_like(validDS[0][1]), validDS[0][1]))
