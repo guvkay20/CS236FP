@@ -15,6 +15,7 @@ from torch.utils import tensorboard
 import rmsd
 import numpy as np
 import pdb
+from datetime import datetime
 
 #random.seed(34)
 #torch.manual_seed(34)
@@ -261,7 +262,7 @@ def predictCoords(model, molGraphs, stepsAtNL=None):
         coordsMatrices = model.generateCoords(molGraphs) if stepsAtNL is None else model.generateCoords(molGraphs, stepsAtNL)
     return coordsMatrices
 
-def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
+def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
     dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
     goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
 
@@ -292,7 +293,7 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
             print("Average Validation Loss", avg_loss.item())
        
         if useRMSD: #
-            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=2, shuffle=True, collate_fn=lambda x:x)
+            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=tp["predict_batchsize"], shuffle=True, collate_fn=lambda x:x)
             rmsds = []
             _rmsd = "N/A"
             for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}", total=goFor)):
@@ -313,7 +314,10 @@ def validate(model, validation_dataset, use_ratio, batch_size, device, sw=None, 
                 coords_hats = predictCoords(model, Xs, pred_stepsAtNL)
                 for X, coord_hat in zip(Xs, coords_hats):
                     X.predCoords = coord_hat
-                    torch.save(X, "predictions/predicted_structure_"+str(random.randint(10000000,99999999)))
+                    structureCode = str(random.randint(10000000,99999999))
+                    torch.save(X, "predictions/predicted_structure_"+structureCode)
+                    with open("predicthistory", "a") as f:
+                        f.write(structureCode + " : " + str(X.atoms) + "\n")
                     _rmsd = RMSD(coord_hat, X.coords)
                     rmsds.append(_rmsd)
                     print(_rmsd)
@@ -328,11 +332,13 @@ def test(model, test_dataset, batch_size, device):
 
     
 
-def train(model, training_dataset, validation_dataset, # dataset is torch dataset
+def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is torch dataset
         device, batch_size, num_epochs, loaded_model_from_checkpoint=False):
     
-    trainCode = random.randint(100000,999999)
+    trainCode = str(datetime.now()).replace(" ","_")#random.randint(100000,999999)
     print("Training Code", trainCode)
+    with open("trainhistory","a") as f:
+        f.write(trainCode + " : " + str(hyper) + "\n")
     sw = tensorboard.SummaryWriter(log_dir="logs/"+str(trainCode)+"/")
 
     model.to(device)
@@ -347,7 +353,7 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
         model.apply(initer)
     model.train()
     
-    optimizer = torch.optim.AdamW(model.parameters())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=hyper["lr"])
     loss = torch.tensor([1.0])
 
     for epoch in range(num_epochs):
@@ -361,13 +367,13 @@ def train(model, training_dataset, validation_dataset, # dataset is torch datase
             loss.backward()
             optimizer.step()
 
-            if (batch_no*batch_size) % 80 < batch_size:
+            if (batch_no*batch_size) % tp["intraepoch_val_every"] < batch_size:
                 print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
-                validate(model, validation_dataset, 0.2, batch_size, device, sw,batch_no*batch_size+epoch*len(training_dataset))
+                validate(tp, model, validation_dataset, tp["intraepoch_val_ratio"], tp["val_batchsize"], device, sw,batch_no*batch_size+epoch*len(training_dataset))
 
         
         print("End of Epoch",epoch,"\n")    
-        validate(model, validation_dataset, 1.0, batch_size, device, sw, epoch)
+        validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, epoch)
 
         torch.save(model.state_dict(),
             "checkpoints/train_endEpoch_"+str(trainCode)+"_epoch"+str(epoch)
@@ -410,6 +416,34 @@ def DSstat(train, valid, test):
 
 
 
+def defaultTPs():
+    return {
+        "intraepoch_val_ratio":0.2,
+        "intraepoch_val_every":80,
+        "predict_steps_per_NL":10,
+        "mode_val_ratio":1.0,
+        "val_batchsize":4,
+        "predict_batchsize":2,
+    }
+
+def defaultHypers():
+    return {
+        "mgin_conv_inlevel_layers":2,
+        "mgin_conv_outlevel_layers":1,
+        "mgin_layers":10,
+        "noise_level_min":0.5,
+        "noise_level_ratio":1.1,
+        "noise_level_max":40.0,
+        "embed_dims":3,
+        "num_epochs":100,
+        "mlp_in_layers":2,
+        "mlp_mid_layers":2,
+        "base_step_size": 2e-5,
+        "gen_initial_std":40.0,
+        "lr":1e-3,
+        "train_batchsize":2
+    }
+
 # Modes:
 #   train: Trains Model, requires prepped DSs
 #   validate: Runs validation (Loss + RMSD) on ValidDS, requires prepped DSs and trained model
@@ -440,8 +474,11 @@ if __name__ == "__main__":
     if args.mode=="dataset_stat":
         DSstat(trainDS, validDS, testDS)
         quit()
-    
-    model = RNADiffuser()
+   
+    hyper = defaultHypers()
+    tp = defaultTPs()
+
+    model = RNADiffuser(hyper)
     loaded = False
     if args.model_path is not None:
         loaded = True
@@ -450,9 +487,9 @@ if __name__ == "__main__":
     
     if args.mode=="train":
         
-        train(model, trainDS, validDS, device, 2, 100, loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
+        train(hyper, tp, model, trainDS, validDS, device, hyper["train_batchsize"], hyper["num_epochs"], loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
     elif args.mode=="validate":
-        validate(model, validDS, 0.1, 2, device, useRMSD = True, log=False, pred_stepsAtNL = 1) # TODO 0.1 is a joke but required for rmsd realistic runtime
+        validate(tp, model, validDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = tp["predict_steps_per_NL"]) # TODO 0.1 is a joke but required for rmsd realistic runtime
     elif args.mode=="predict":
         #print("RMSD",RMSD(predictCoords(model, recon(validDS[0], device), 1), validDS[0][1]))       # Currently set to debug prediction, TODO include sequence reconstruction
         print("RMSD",RMSD(torch.randn_like(validDS[0][1]), validDS[0][1]))

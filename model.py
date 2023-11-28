@@ -12,16 +12,15 @@ import pdb
 # Look at ConfGF
 
 class MGINConv(pyg.nn.MessagePassing):
-    def __init__(self, channels):
+    def __init__(self, channels, hyper):
         super().__init__('add')
+        
         self.aggSum = nn.Sequential(
-            nn.Linear(6,6),
-            nn.LeakyReLU(),
-            nn.Linear(6,6),
-            nn.LeakyReLU(),
-            nn.Linear(6,3),
-            nn.LeakyReLU(),
-            nn.Linear(3,3)
+                *([nn.Linear(2*channels,2*channels),nn.LeakyReLU()] *hyper["mgin_conv_inlevel_layers"]
+                +
+                [nn.Linear(2*channels,channels)]
+                +
+                [nn.LeakyReLU(),nn.Linear(channels,channels)] *hyper["mgin_conv_outlevel_layers"])
         ) 
 
     def forward(self, node_embeds, edge_embeds, edge_index, cutoffs, graph_lens):
@@ -55,9 +54,9 @@ class MGINConv(pyg.nn.MessagePassing):
 
 
 class ModifiedGIN(nn.Module):
-    def __init__(self, channels, num_layers):
+    def __init__(self, channels, hyper):
         super().__init__()
-        self.conv = nn.ModuleList([MGINConv(channels) for _ in range(num_layers)])  
+        self.conv = nn.ModuleList([MGINConv(channels,hyper) for _ in range(hyper["mgin_layers"])])  
 
     def forward(self, node_embeds, edge_embeds, molGraphs):
         #pdb.set_trace()
@@ -71,35 +70,31 @@ class ModifiedGIN(nn.Module):
         return torch.nn.utils.rnn.pad_sequence(torch.split(node_embeds, [len(mg.atoms) for mg in molGraphs]), batch_first=True)
 
 class RNADiffuser(nn.Module):
-    def __init__(self):
+    def __init__(self, hyper):
         super().__init__()
         
         self.embedMap = dict()
-        self.nodeEmbedder = nn.Embedding(100, 3, padding_idx=0)
-        self.edgeEmbedder = nn.Linear(4, 3)
-        self.edgeNetwork = ModifiedGIN(3,10)
-        self.finalEmbedder = nn.Sequential(
-                nn.Linear(9,9),
-                nn.LeakyReLU(),
-                nn.Linear(9,9),
-                nn.LeakyReLU(),
-                nn.Linear(9,3),
-                nn.LeakyReLU(),
-                nn.Linear(3,3),
-                nn.LeakyReLU(),
-                nn.Linear(3,3),
-                nn.LeakyReLU(),
-                nn.Linear(3,1)
-        )
+        self.nodeEmbedder = nn.Embedding(100, hyper["embed_dims"], padding_idx=0)
+        self.edgeEmbedder = nn.Linear(4, hyper["embed_dims"])
+        self.edgeNetwork = ModifiedGIN(hyper["embed_dims"],hyper)
+        self.finalEmbedder = nn.Sequential(*(
+                [nn.Linear(3*hyper["embed_dims"],3*hyper["embed_dims"]),nn.LeakyReLU()] * hyper["mlp_in_layers"] +
+                [nn.Linear(3*hyper["embed_dims"],hyper["embed_dims"])] +
+                [nn.LeakyReLU(),nn.Linear(hyper["embed_dims"],hyper["embed_dims"])] * hyper["mlp_mid_layers"] +
+                [nn.LeakyReLU(),nn.Linear(hyper["embed_dims"],1)]
+        ))
         
         self.noiseLevels = []
-        nl = 40.0
-        ratio = 1.1
-        while nl > 0.5:
+        nl = hyper["noise_level_max"]
+        ratio = hyper["noise_level_ratio"]
+        while nl > hyper["noise_level_min"]:
             self.noiseLevels.append(nl)
             nl /= ratio
 
-        self.baseStepSize = 2e-5
+        self.baseStepSize = hyper["base_step_size"]
+        self.initialDeviation = hyper["gen_initial_std"]
+
+        self.hyper = hyper
 
     def forward(self, molGraphs, d_sims):
         # molGraph format:
@@ -189,7 +184,7 @@ class RNADiffuser(nn.Module):
             psums_el = torch.cat([torch.tensor([0]),torch.cumsum(enders_lens,0) ], dim=0)
             edgeStuffs.append((sourceds,sourceds_lens,enders,enders_lens,psums_sl,psums_el))
 ###
-        R = torch.normal(torch.zeros((len(molGraphs),max([len(molGraph.atoms) for molGraph in molGraphs]),3)), 10) # 10 is estimated radius
+        R = torch.normal(torch.zeros((len(molGraphs),max([len(molGraph.atoms) for molGraph in molGraphs]),3)), self.initialDeviation) # 10 is estimated radius
         iters = 0
         with tqdm(total=len(self.noiseLevels)*stepsAtNL, desc=f"Generating Molecule Structure") as pbar:
             #print("Noise Levels", self.noiseLevels)
