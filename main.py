@@ -198,7 +198,7 @@ class MGDS(torch.utils.data.Dataset): # MolGraphDataSet
         mg = self.mgs[idx]#copy.deepcopy(self.mgs[idx])
         #y = mg.coords
         #mg.coords = None
-        return mg.atoms, mg.coords, mg.adjList#mg, y
+        return mg.atoms, mg.coords, mg.adjList, mg.seq#mg, y
 
 def makeDSs(datafolder, device, cutoffs):  # device is relic, unused
     pdbs = [datafolder+"/"+f for f in os.listdir(datafolder) if (f[-4:]==".pdb")]
@@ -214,26 +214,28 @@ def makeDSs(datafolder, device, cutoffs):  # device is relic, unused
     return train, valid, test
 
 def recon(a, device):
-    x,y,z = a
+    x,y,z,q = a
     y = y.to(device)
     z = z.to(device)
     X = MolGraph(device)
     X.atoms = x
     X.adjList = z
     X.coords = y
+    X.seq = q
     X.generateIndices()
     return X
  
 
 def getloss(model, batch, device):
     molgraphs = list()
-    for (x,y,z) in batch:
+    for (x,y,z,q) in batch:
         y = y.to(device)
         z = z.to(device)
         X = MolGraph(device)
         X.atoms = x
         X.adjList = z
         X.coords = y
+        X.seq = q
         X.generateIndices()
         molgraphs.append(X)        
 
@@ -273,24 +275,59 @@ def predictCoords(model, molGraphs, stepsAtNL=None):
         coordsMatrices = model.generateCoords(molGraphs) if stepsAtNL is None else model.generateCoords(molGraphs, stepsAtNL)
     return coordsMatrices
 
+def customLoader(valDS, factor, canSort):
+    if canSort:
+        order = list(range(len(valDS)))
+        order.sort(key=lambda i : len(valDS[i][0]))
+    else:
+        order = list(range(len(valDS)))
+        random.shuffle(order)
+    batches = list()
+    batch = list()
+    ibatches = list()
+    ibatch = list()
+    maxleninbatch = 0
+    maxTolerance = 11.5
+    for i in order:
+        item = valDS[i]
+        if (len(item[0]) > 7000) or (len(item[0]) == 4953): # Memory, and special problem, respectively
+            continue
+        if (max(len(item[0])/1000,maxleninbatch)**2) *(1+len(batch)) * factor > maxTolerance:
+            batches.append(batch)
+            ibatches.append(ibatch)
+            batch = list()
+            ibatch = list()
+            maxleninbatch = 0
+        batch.append(item)
+        ibatch.append(i)
+        maxleninbatch = max(len(item[0])/1000,maxleninbatch)
+    batches.append(batch)
+    ibatches.append(ibatch)
+    return batches
+
+# NOTE use_ratio is deprecated; only changes recording
 def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
-    dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
-    goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
+    #dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
+    #pdb.set_trace()
+    dataloader = customLoader(validation_dataset, factor=0.09, canSort=True)
+    #goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
 
     model.eval()
     with torch.no_grad():
 
         losses = []
-        for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating', total=goFor)): # TODO averaging is slightly skewed on last iter
-            if batch_no == goFor:
-                break
-           
+        for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating')):#, total=goFor)):
+            #print(torch.cuda.memory_summary())
+            #print([len(x) for x,y,z in batch])
+            #if batch_no == goFor:
+            #    break
+            #break 
             loss = getloss(model, batch, device)
 
-            losses.append(loss)
+            losses.append(loss*len(batch))
 
 
-        avg_loss = sum(losses)/len(losses)
+        avg_loss = torch.tensor(sum(losses)/len(validation_dataset))
 
         
 
@@ -301,24 +338,28 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
                 sw.add_scalar('loss/intravalid',avg_loss,st)
             else:
                 sw.add_scalar('loss/intervalid',avg_loss,st)
-            print("Average Validation Loss", avg_loss.item())
+        print("Average Validation Loss", avg_loss.item())
        
         if useRMSD: #
-            rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=tp["predict_batchsize"], shuffle=True, collate_fn=lambda x:x)
+            #rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=tp["predict_batchsize"], shuffle=True, collate_fn=lambda x:x)
+            rmsdDL = customLoader(validation_dataset, factor=0.10, canSort=True)
             rmsds = []
             _rmsd = "N/A"
-            for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}", total=goFor)):
-                if batch_no == goFor:
-                    break
+            for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}")):#, total=goFor)):
+                #if batch_no == goFor:
+                #    break
+                #print(torch.cuda.memory_summary())
+                #print([len(x) for x,y,z,q in batch])
                 
                 Xs = list()
-                for (x,y,z) in batch:
+                for (x,y,z,q) in batch:
                     y = y.to(device)
                     z = z.to(device)
                     X = MolGraph(device)
                     X.atoms = x
                     X.adjList = z
                     X.coords = y
+                    X.seq = q
                     X.generateIndices()
                     Xs.append(X)
 
@@ -367,10 +408,14 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
     optimizer = torch.optim.AdamW(model.parameters(), lr=hyper["lr"])
     loss = torch.tensor([1.0])
 
+    validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, 0)
     for epoch in range(num_epochs):
-        dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
+        #dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
+        dataloader = customLoader(training_dataset, factor=0.22, canSort=False)
 
         for batch_no, batch in enumerate(tqdm(dataloader, desc=f'Training Iters, Epoch: {epoch}, CurLoss: {loss.to("cpu").item()}')):
+            #print(torch.cuda.memory_summary())
+            #print([len(x) for x,y,z,q in batch])
             optimizer.zero_grad()
 
             loss = getloss(model, batch, device)
@@ -378,13 +423,14 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
             loss.backward()
             optimizer.step()
 
-            if (batch_no*batch_size) % tp["intraepoch_val_every"] < batch_size:
-                print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
-                validate(tp, model, validation_dataset, tp["intraepoch_val_ratio"], tp["val_batchsize"], device, sw,batch_no*batch_size+epoch*len(training_dataset))
+            # Limited benefit in intraepoch, IMO
+            #if (batch_no*batch_size) % tp["intraepoch_val_every"] < batch_size:
+            #    print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
+            #    validate(tp, model, validation_dataset, tp["intraepoch_val_ratio"], tp["val_batchsize"], device, sw,batch_no*batch_size+epoch*len(training_dataset))
 
         
         print("End of Epoch",epoch,"\n")    
-        validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, epoch)
+        validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, epoch+1)
 
         torch.save(model.state_dict(),
             "checkpoints/train_endEpoch_"+str(trainCode)+"_epoch"+str(epoch)
@@ -434,7 +480,7 @@ def defaultTPs():
         "predict_steps_per_NL":10,
         "mode_val_ratio":1.0,
         "val_batchsize":4,
-        "predict_batchsize":2,
+        "predict_batchsize":6,
     }
 
 def defaultHypers():
@@ -446,7 +492,7 @@ def defaultHypers():
         "noise_level_ratio":1.1,
         "noise_level_max":40.0,
         "embed_dims":3,
-        "num_epochs":100,
+        "num_epochs":30,
         "mlp_in_layers":2,
         "mlp_mid_layers":2,
         "base_step_size": 2e-5,
@@ -501,9 +547,8 @@ if __name__ == "__main__":
         loaded = True
         model.load_state_dict(torch.load(args.model_path))
     model.to(device)
-    
+   
     if args.mode=="train":
-        
         train(hyper, tp, model, trainDS, validDS, device, hyper["train_batchsize"], hyper["num_epochs"], loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
     elif args.mode=="validate":
         validate(tp, model, validDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = tp["predict_steps_per_NL"]) # TODO 0.1 is a joke but required for rmsd realistic runtime
