@@ -46,6 +46,7 @@ class MolGraph():
             return False
         if len(rnas.get_all_chain_ids()) > 1:
             return False
+        self.seq = seq
 
         for acid in seq:
             if acid not in set(['A','C','G','U']):
@@ -154,6 +155,7 @@ class MolGraph():
         return des
         
     def makeFromSeq(self, seq): # TODO, generate atoms and adjlist
+        self.seq = seq
         pass
 
     def getNeighborsBySource(self): # (.,neigh)
@@ -326,7 +328,7 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
                     structureCode = str(random.randint(10000000,99999999))
                     torch.save(X, "predictions/predicted_structure_"+structureCode)
                     with open("predicthistory", "a") as f:
-                        f.write(structureCode + " : " + str(X.atoms) + "\n")
+                        f.write(structureCode + " : " + str(X.seq) + "\n")
                     _rmsd = RMSD(coord_hat, X.coords)
                     rmsds.append(_rmsd)
                     print(_rmsd)
