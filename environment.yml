@@ -1,12 +1,16 @@
 name: CS236FP
 channels:
     - pytorch
+    - nvidia
     - pyg
     - anaconda
     - conda-forge
 dependencies:
     - python >= 3.0
     - pytorch
+    - torchvision
+    - torchaudio
+    - pytorch-cuda=11.8
     - pyg
     - pandas
     - git
@@ -17,7 +21,7 @@ dependencies:
     - biopython
     - pip
     - biopython
-    pip:
+    - pip:
         - rna-tools
         - rmsd
         - packaging

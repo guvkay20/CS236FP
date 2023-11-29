@@ -21,13 +21,18 @@ from datetime import datetime
 #torch.manual_seed(34)
 
 class MolGraph():
-    def __init__(self):
+    def __init__(self,device):
         self.atoms = None # List; atom types
         self.adjList = None # Tensor of [numedges,2]
         self.coords = None # Tensor of  [numnodes,3]
         self.indices = None # Duple of 1D Tensors
         self.nbs = None
         self.nbe = None
+        self.device = device
+
+    def to(self,device):
+        self.device = device
+        return self
 
     def readFromPDB(self, pdbPath): # Needs Coords
         print(pdbPath)
@@ -55,7 +60,7 @@ class MolGraph():
                     return False
                 self.atoms.append(rnas.get_atom_code(line))
                 try:
-                    self.coords.append(torch.tensor(rnas.get_atom_coords(line)))
+                    self.coords.append(torch.tensor(rnas.get_atom_coords(line)).to(self.device))
                 except:
                     return False
         self.coords = torch.stack(self.coords, dim=0)
@@ -128,7 +133,7 @@ class MolGraph():
         except:
             return False
         
-        self.adjList = torch.stack(adjList, dim=0)
+        self.adjList = torch.stack(adjList, dim=0).to(self.device)
         return True
 
     def generateIndices(self): # NOTE: Must have self.atoms
@@ -139,7 +144,7 @@ class MolGraph():
                 self.indices[1].extend(list(range(i+1,len(self.atoms))))
 
     def desparseEdges(self): # Note must have indices and self.adjList
-        des = torch.zeros(len(self.indices[0]), dtype=torch.bool)
+        des = torch.zeros(len(self.indices[0]), dtype=torch.bool).to(self.device)
         lowerIndex = torch.min(self.adjList, dim=1).values
         higherIndex = torch.max(self.adjList, dim=1).values
         indexOffset = higherIndex - lowerIndex - 1
@@ -161,7 +166,7 @@ class MolGraph():
                 numNeighsBySource.append(len(neighsOfI))
             neighsBySource
             self.nbs = (neighsBySource, numNeighsBySource)
-        return torch.tensor(self.nbs[0]), torch.tensor(self.nbs[1])
+        return torch.tensor(self.nbs[0]).to(self.device), torch.tensor(self.nbs[1]).to(self.device)
 
     def getNeighborsByEnd(self):  # (neigh,.)
         if self.nbe is None:
@@ -172,13 +177,17 @@ class MolGraph():
                 neighsByEnd.extend(neighsOfI)
                 numNeighsByEnd.append(len(neighsOfI))
             self.nbe = (neighsByEnd, numNeighsByEnd)
-        return torch.tensor(self.nbe[0]), torch.tensor(self.nbe[1])
+        return torch.tensor(self.nbe[0]).to(self.device), torch.tensor(self.nbe[1]).to(self.device)
 
 class MGDS(torch.utils.data.Dataset): # MolGraphDataSet
-    def __init__(self, pdbPathsList):
-       mgs = [MolGraph() for p in pdbPathsList] 
+    def __init__(self, pdbPathsList, device):
+       mgs = [MolGraph(device) for p in pdbPathsList] 
        res = [mg.readFromPDB(p) for mg,p in zip(mgs,pdbPathsList)]
        self.mgs = [mg for mg,r in zip(mgs,res) if r]
+    
+    def to(self, device):
+        self.mgs = [mg.to(device) for mg in self.mgs]
+        return self
 
     def __len__(self):
         return len(self.mgs)
@@ -196,9 +205,9 @@ def makeDSs(datafolder, device, cutoffs):  # device is relic, unused
     c0 = int(float(len(pdbs)) * cutoffs[0])
     c1 = int(float(len(pdbs)) * cutoffs[1])
 
-    train = MGDS(pdbs[:c0])
-    valid = MGDS(pdbs[c0:c1])
-    test = MGDS(pdbs[c1:])
+    train = MGDS(pdbs[:c0], 'cpu')
+    valid = MGDS(pdbs[c0:c1], 'cpu')
+    test = MGDS(pdbs[c1:], 'cpu')
 
     return train, valid, test
 
@@ -206,7 +215,7 @@ def recon(a, device):
     x,y,z = a
     y = y.to(device)
     z = z.to(device)
-    X = MolGraph()
+    X = MolGraph(device)
     X.atoms = x
     X.adjList = z
     X.coords = y
@@ -219,7 +228,7 @@ def getloss(model, batch, device):
     for (x,y,z) in batch:
         y = y.to(device)
         z = z.to(device)
-        X = MolGraph()
+        X = MolGraph(device)
         X.atoms = x
         X.adjList = z
         X.coords = y
@@ -304,7 +313,7 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
                 for (x,y,z) in batch:
                     y = y.to(device)
                     z = z.to(device)
-                    X = MolGraph()
+                    X = MolGraph(device)
                     X.atoms = x
                     X.adjList = z
                     X.coords = y
@@ -359,11 +368,11 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
     for epoch in range(num_epochs):
         dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
 
-        for batch_no, batch in enumerate(tqdm(dataloader, desc=f'Training Iters, Epoch: {epoch}, CurLoss: {loss.item()}')):
+        for batch_no, batch in enumerate(tqdm(dataloader, desc=f'Training Iters, Epoch: {epoch}, CurLoss: {loss.to("cpu").item()}')):
             optimizer.zero_grad()
 
             loss = getloss(model, batch, device)
-            sw.add_scalar("loss/train",loss.item(),batch_no*batch_size+epoch*len(training_dataset))
+            sw.add_scalar("loss/train",loss.to('cpu').item(),batch_no*batch_size+epoch*len(training_dataset))
             loss.backward()
             optimizer.step()
 
@@ -470,6 +479,12 @@ if __name__ == "__main__":
         quit()
     
     trainDS, validDS, testDS = pickle.load(open(args.dataset_folder+"/DSs.pkl","rb"))
+    trainDS = trainDS.to(device)
+    validDS = validDS.to(device)
+    testDS = testDS.to(device)
+    #trainDS.device = device
+    #validDS.device = device
+    #testDS.device = device
 
     if args.mode=="dataset_stat":
         DSstat(trainDS, validDS, testDS)
@@ -478,12 +493,12 @@ if __name__ == "__main__":
     hyper = defaultHypers()
     tp = defaultTPs()
 
-    model = RNADiffuser(hyper)
+    model = RNADiffuser(hyper, device)
     loaded = False
     if args.model_path is not None:
         loaded = True
         model.load_state_dict(torch.load(args.model_path))
-
+    model.to(device)
     
     if args.mode=="train":
         
@@ -492,7 +507,7 @@ if __name__ == "__main__":
         validate(tp, model, validDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = tp["predict_steps_per_NL"]) # TODO 0.1 is a joke but required for rmsd realistic runtime
     elif args.mode=="predict":
         #print("RMSD",RMSD(predictCoords(model, recon(validDS[0], device), 1), validDS[0][1]))       # Currently set to debug prediction, TODO include sequence reconstruction
-        print("RMSD",RMSD(torch.randn_like(validDS[0][1]), validDS[0][1]))
+        print("RMSD",RMSD(torch.randn_like(validDS[0][1]).to(device), validDS[0][1]))
     elif args.mode=="test":
         print("Testing not implemented")
         raise Exception

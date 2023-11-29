@@ -12,9 +12,10 @@ import pdb
 # Look at ConfGF
 
 class MGINConv(pyg.nn.MessagePassing):
-    def __init__(self, channels, hyper):
+    def __init__(self, channels, hyper, device):
         super().__init__('add')
-        
+        self.device = device
+
         self.aggSum = nn.Sequential(
                 *([nn.Linear(2*channels,2*channels),nn.LeakyReLU()] *hyper["mgin_conv_inlevel_layers"]
                 +
@@ -25,7 +26,7 @@ class MGINConv(pyg.nn.MessagePassing):
 
     def forward(self, node_embeds, edge_embeds, edge_index, cutoffs, graph_lens):
         #pdb.set_trace()
-        neigh_update = self.propagate(edge_index.T,x=node_embeds,edge_embeds=edge_embeds,id=torch.tensor(list(range(node_embeds.shape[0]))).reshape((-1,1)), num_nodes=graph_lens,cutoffs=cutoffs)
+        neigh_update = self.propagate(edge_index.T,x=node_embeds,edge_embeds=edge_embeds,id=torch.tensor(list(range(node_embeds.shape[0]))).to(self.device).reshape((-1,1)), num_nodes=graph_lens,cutoffs=cutoffs)
         ret = self.aggSum(torch.cat((neigh_update,node_embeds),dim=1))
         return ret
         
@@ -41,7 +42,7 @@ class MGINConv(pyg.nn.MessagePassing):
         
         index_in_graph_index = torch.sum(a >= cutoffs[1:], dim=1)
         intrasize = num_nodes * (num_nodes - 1) / 2
-        incr_by = torch.cumsum(torch.cat([torch.tensor([0]),intrasize],dim=0)[:-1], dim=0)
+        incr_by = torch.cumsum(torch.cat([torch.tensor([0]).to(self.device),intrasize],dim=0)[:-1], dim=0)
         a_in = a.squeeze(1) - cutoffs[index_in_graph_index]
     
         indices = a_in * (num_nodes[index_in_graph_index] - (a_in * 0.5) - 1.5) + b.squeeze(1) - 1 - cutoffs[index_in_graph_index] + incr_by[index_in_graph_index]
@@ -54,29 +55,31 @@ class MGINConv(pyg.nn.MessagePassing):
 
 
 class ModifiedGIN(nn.Module):
-    def __init__(self, channels, hyper):
+    def __init__(self, channels, hyper, device):
         super().__init__()
-        self.conv = nn.ModuleList([MGINConv(channels,hyper) for _ in range(hyper["mgin_layers"])])  
+        self.device = device
+        self.conv = nn.ModuleList([MGINConv(channels,hyper,device) for _ in range(hyper["mgin_layers"])])  
 
     def forward(self, node_embeds, edge_embeds, molGraphs):
         #pdb.set_trace()
-        node_embeds = torch.cat(nn.utils.rnn.unpad_sequence(node_embeds, torch.tensor([len(mg.atoms) for mg in molGraphs]),batch_first=True), dim=0)
-        edge_embeds = torch.cat(nn.utils.rnn.unpad_sequence(edge_embeds, torch.tensor([len(mg.indices[0]) for mg in molGraphs]),batch_first=True), dim=0)
-        incr_by = torch.cumsum(torch.tensor([0] + [len(mg.atoms) for mg in molGraphs])[:-1], dim=0)
+        node_embeds = torch.cat(nn.utils.rnn.unpad_sequence(node_embeds, torch.tensor([len(mg.atoms) for mg in molGraphs]).to(self.device),batch_first=True), dim=0)
+        edge_embeds = torch.cat(nn.utils.rnn.unpad_sequence(edge_embeds, torch.tensor([len(mg.indices[0]) for mg in molGraphs]).to(self.device),batch_first=True), dim=0)
+        incr_by = torch.cumsum(torch.tensor([0] + [len(mg.atoms) for mg in molGraphs]).to(self.device)[:-1], dim=0)
         edge_index = torch.cat([mg.adjList+incr for incr,mg in zip(incr_by,molGraphs)], dim=0)
 
         for conv in self.conv:
-            node_embeds = conv(node_embeds, edge_embeds, edge_index, incr_by, torch.tensor([len(mg.atoms) for mg in molGraphs])) 
+            node_embeds = conv(node_embeds, edge_embeds, edge_index, incr_by, torch.tensor([len(mg.atoms) for mg in molGraphs]).to(self.device)) 
         return torch.nn.utils.rnn.pad_sequence(torch.split(node_embeds, [len(mg.atoms) for mg in molGraphs]), batch_first=True)
 
 class RNADiffuser(nn.Module):
-    def __init__(self, hyper):
+    def __init__(self, hyper, device):
         super().__init__()
-        
+        self.device = device
+
         self.embedMap = dict()
         self.nodeEmbedder = nn.Embedding(100, hyper["embed_dims"], padding_idx=0)
         self.edgeEmbedder = nn.Linear(4, hyper["embed_dims"])
-        self.edgeNetwork = ModifiedGIN(hyper["embed_dims"],hyper)
+        self.edgeNetwork = ModifiedGIN(hyper["embed_dims"],hyper,device)
         self.finalEmbedder = nn.Sequential(*(
                 [nn.Linear(3*hyper["embed_dims"],3*hyper["embed_dims"]),nn.LeakyReLU()] * hyper["mlp_in_layers"] +
                 [nn.Linear(3*hyper["embed_dims"],hyper["embed_dims"])] +
@@ -129,8 +132,8 @@ class RNADiffuser(nn.Module):
         final_node_embeds = self.edgeNetwork(node_embeds, edge_embeds, molGraphs)
 
         # after network, concat source || neighbor || edge embeds, use final to the nodes; subject to MLP, get edge scores in 3D
-        LHS = torch.nn.utils.rnn.pad_sequence([torch.index_select(final_node_embeds[i], 0, torch.tensor(molGraph.indices[0])) for i,molGraph in enumerate(molGraphs)], batch_first=True)# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
-        RHS = torch.nn.utils.rnn.pad_sequence([torch.index_select(final_node_embeds[i], 0, torch.tensor(molGraph.indices[1])) for i,molGraph in enumerate(molGraphs)], batch_first=True)#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
+        LHS = torch.nn.utils.rnn.pad_sequence([torch.index_select(final_node_embeds[i], 0, torch.tensor(molGraph.indices[0]).to(self.device)) for i,molGraph in enumerate(molGraphs)], batch_first=True)# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
+        RHS = torch.nn.utils.rnn.pad_sequence([torch.index_select(final_node_embeds[i], 0, torch.tensor(molGraph.indices[1]).to(self.device)) for i,molGraph in enumerate(molGraphs)], batch_first=True)#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
         
         concat_embeds = torch.cat((LHS,RHS,edge_embeds),dim=2)
         scores = self.finalEmbedder(concat_embeds)
@@ -152,12 +155,12 @@ class RNADiffuser(nn.Module):
         #for noise_level in noiseLevels:
         #with random.choice(self.noiseLevels) as noise_level:  # TODO noise level as input to score fxn; maybe not
         #pdb.set_trace()
-        noise_levels = torch.tensor(random.choices(self.noiseLevels, k=len(molGraphs)))
+        noise_levels = torch.tensor(random.choices(self.noiseLevels, k=len(molGraphs))).to(self.device)
     
         with torch.no_grad():
             ds,vals = self.computeDVectors(molGraphs)#molGraph.coords, molGraph.indices)
             
-            d_sims = ds + torch.normal(torch.zeros(ds.shape), torch.ones(ds.shape) * noise_levels.unsqueeze(1))
+            d_sims = ds + torch.normal(torch.zeros(ds.shape).to(self.device), torch.ones(ds.shape).to(self.device) * noise_levels.unsqueeze(1))
                 
 
         scores = self.forward(molGraphs, d_sims)
@@ -180,11 +183,11 @@ class RNADiffuser(nn.Module):
             molGraph = molGraphs[i]
             sourceds, sourceds_lens = molGraph.getNeighborsBySource() # These don't get inverted
             enders, enders_lens = molGraph.getNeighborsByEnd() # These get inverted
-            psums_sl = torch.cat([torch.tensor([0]),torch.cumsum(sourceds_lens,0) ], dim=0)
-            psums_el = torch.cat([torch.tensor([0]),torch.cumsum(enders_lens,0) ], dim=0)
+            psums_sl = torch.cat([torch.tensor([0]).to(self.device),torch.cumsum(sourceds_lens,0) ], dim=0)
+            psums_el = torch.cat([torch.tensor([0]).to(self.device),torch.cumsum(enders_lens,0) ], dim=0)
             edgeStuffs.append((sourceds,sourceds_lens,enders,enders_lens,psums_sl,psums_el))
 ###
-        R = torch.normal(torch.zeros((len(molGraphs),max([len(molGraph.atoms) for molGraph in molGraphs]),3)), self.initialDeviation) # 10 is estimated radius
+        R = torch.normal(torch.zeros((len(molGraphs),max([len(molGraph.atoms) for molGraph in molGraphs]),3)).to(self.device), self.initialDeviation) # 10 is estimated radius
         iters = 0
         with tqdm(total=len(self.noiseLevels)*stepsAtNL, desc=f"Generating Molecule Structure") as pbar:
             #print("Noise Levels", self.noiseLevels)
@@ -223,10 +226,10 @@ class RNADiffuser(nn.Module):
                     s = torch.nn.utils.rnn.pad_sequence(s,batch_first=True)
 ###
                     # Compute s theta
-                    z = torch.normal(torch.zeros(R.shape),torch.ones(R.shape))
+                    z = torch.normal(torch.zeros(R.shape),torch.ones(R.shape)).to(self.device)
                     R = R + step_size * s + z * math.sqrt(2 * step_size)
         #pdb.set_trace()
-        R = torch.nn.utils.rnn.unpad_sequence(R, torch.tensor([len(mg.atoms)  for mg in molGraphs]), batch_first=True)
+        R = torch.nn.utils.rnn.unpad_sequence(R, torch.tensor([len(mg.atoms)  for mg in molGraphs]).to(self.device), batch_first=True)
         return R
 
     def pairwiseDisplacements(self, coords, indices): # raster order elemwise deltas
@@ -236,8 +239,8 @@ class RNADiffuser(nn.Module):
         # n-2 to n-1
         # all in 1D
         
-        LHS = torch.index_select(coords, 0, torch.tensor(indices[0]))# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
-        RHS = torch.index_select(coords, 0, torch.tensor(indices[1]))#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
+        LHS = torch.index_select(coords, 0, torch.tensor(indices[0]).to(self.device))# 0 n-1 times, 1 n-2 times, 2 n-3 times ... n-2 1 time
+        RHS = torch.index_select(coords, 0, torch.tensor(indices[1]).to(self.device))#1,2,...n-1,2,3,...n-1,....n-1,n-2,n-1,n-1
 
         return LHS - RHS
 
