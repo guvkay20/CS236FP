@@ -501,6 +501,44 @@ def defaultHypers():
         "train_batchsize":2
     }
 
+def hp_search(trainDS, validDS, device):
+    tp = defaultTPs()
+    basehypers = defaultHypers()
+    hyperranges = dict()
+    for k,v in basehypers.items():
+        hyperranges[k] = [v]
+    
+    # TODO custom mods on top
+    # TODO only to variations
+    # TODO fewer epochs
+
+    # all combos
+    #hypers = [dict()]
+    #for k,r in hyperranges:
+    #    newhypers = list()
+    #    for hyper in hypers:
+    #        for v in r:
+    #            h = copy.deepcopy(hyper)
+    #            h[k] = v
+    #            newhypers.append(h)
+    #    
+    #    hypers = newhypers
+    
+    # each, separately
+    hypers = []
+    for k,r in hyperranges:
+        for v in r:
+            hyper = defaultHypers()
+            hyper[k] = v
+            hypers.append(hyper)
+
+    for hyper in hypers:
+        print("HP Search at: " + str(hyper))
+        model = RNADiffuser(hyper, device)
+        model.to(device)
+        train(hyper, tp, model, trainDS, validDS, device, hyper["train_batchsize"], hyper["num_epochs"], False)
+
+
 # Modes:
 #   train: Trains Model, requires prepped DSs
 #   validate: Runs validation (Loss + RMSD) on ValidDS, requires prepped DSs and trained model
@@ -537,7 +575,11 @@ if __name__ == "__main__":
     if args.mode=="dataset_stat":
         DSstat(trainDS, validDS, testDS)
         quit()
-   
+    elif args.mode =="hp_search":
+        hp_search(trainDS, validDS, device)
+        quit()
+
+
     hyper = defaultHypers()
     tp = defaultTPs()
 
