@@ -293,8 +293,9 @@ def customLoader(valDS, factor, canSort):
         if (len(item[0]) > 7000) or (len(item[0]) == 4953): # Memory, and special problem, respectively
             continue
         if (max(len(item[0])/1000,maxleninbatch)**2) *(1+len(batch)) * factor > maxTolerance:
-            batches.append(batch)
-            ibatches.append(ibatch)
+            if (maxleninbatch**2)*len(batch)*factor <= maxTolerance:
+                batches.append(batch)
+                ibatches.append(ibatch)
             batch = list()
             ibatch = list()
             maxleninbatch = 0
@@ -309,7 +310,8 @@ def customLoader(valDS, factor, canSort):
 def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
     #dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
     #pdb.set_trace()
-    dataloader = customLoader(validation_dataset, factor=0.09, canSort=True)
+    dataloader = customLoader(validation_dataset, factor=0.18,#0.09, TODO
+            canSort=False)
     #goFor = 1 + int((use_ratio * len(validation_dataset) - 1.0) / float(batch_size))
 
     model.eval()
@@ -317,8 +319,8 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
 
         losses = []
         for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating')):#, total=goFor)):
-            #print(torch.cuda.memory_summary())
-            #print([len(x) for x,y,z in batch])
+            print(torch.cuda.memory_summary())
+            print([len(x) for x,y,z,q in batch])
             #if batch_no == goFor:
             #    break
             #break 
@@ -342,7 +344,8 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
        
         if useRMSD: #
             #rmsdDL = torch.utils.data.DataLoader(validation_dataset, batch_size=tp["predict_batchsize"], shuffle=True, collate_fn=lambda x:x)
-            rmsdDL = customLoader(validation_dataset, factor=0.10, canSort=True)
+            rmsdDL = customLoader(validation_dataset, factor=0.20,#TODO 0.10,
+                                    canSort=True)
             rmsds = []
             _rmsd = "N/A"
             for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD, Last RMSD was {_rmsd}")):#, total=goFor)):
@@ -412,9 +415,11 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
     overallcount = 0
     for epoch in range(num_epochs):
         #dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
-        dataloader = customLoader(training_dataset, factor=0.22, canSort=False)
+        dataloader = customLoader(training_dataset, factor=0.44,#0.22, TODO
+                canSort=False)
 
         for batch_no, batch in enumerate(tqdm(dataloader, desc=f'Training Iters, Epoch: {epoch}, CurLoss: {loss.to("cpu").item()}')):
+            #print([len(x) for (x,y,z,q) in batch])
             #print(torch.cuda.memory_summary())
             #print([len(x) for x,y,z,q in batch])
             optimizer.zero_grad()
@@ -511,11 +516,30 @@ def hp_search(trainDS, validDS, device):
     
     # TODO custom mods on top
     # TODO only to variations
-    # TODO fewer epochs
+    #  fewer epochs
+    
+    hyperranges = {
+        #"mgin_conv_inlevel_layers":[1,4],
+        #"mgin_conv_outlevel_layers":[2,4],
+        #"mgin_layers":[5,15],
+        #"noise_level_min":0.5, 
+        #"noise_level_ratio":[1.3,1.5],
+        #"noise_level_max":[20.0,60.0],
+        "embed_dims":[2,4,6],
+        #"num_epochs":30,
+        "mlp_in_layers":[1,4],
+        "mlp_mid_layers":[1,4],
+        #"base_step_size": 2e-5,
+        #"gen_initial_std":40.0,
+        #"lr":1e-3,
+        #"train_batchsize":2
+    }
+
+
 
     # all combos
     #hypers = [dict()]
-    #for k,r in hyperranges:
+    #for k,r in hyperranges.items():
     #    newhypers = list()
     #    for hyper in hypers:
     #        for v in r:
@@ -526,12 +550,16 @@ def hp_search(trainDS, validDS, device):
     #    hypers = newhypers
     
     # each, separately
-    hypers = []
-    for k,r in hyperranges:
+    #hypers = [defaultHypers()]
+    hypers = list()
+    for k,r in hyperranges.items():
         for v in r:
             hyper = defaultHypers()
             hyper[k] = v
+            hyper["num_epochs"] = 10
             hypers.append(hyper)
+
+    #pdb.set_trace()
 
     for hyper in hypers:
         print("HP Search at: " + str(hyper))
