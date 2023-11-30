@@ -409,6 +409,7 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
     loss = torch.tensor([1.0])
 
     validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, 0)
+    overallcount = 0
     for epoch in range(num_epochs):
         #dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
         dataloader = customLoader(training_dataset, factor=0.22, canSort=False)
@@ -419,10 +420,10 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
             optimizer.zero_grad()
 
             loss = getloss(model, batch, device)
-            sw.add_scalar("loss/train",loss.to('cpu').item(),batch_no*batch_size+epoch*len(training_dataset))
+            sw.add_scalar("loss/train",loss.to('cpu').item(),overallcount)#batch_no*batch_size+epoch*len(training_dataset))
             loss.backward()
             optimizer.step()
-
+            overallcount += 1
             # Limited benefit in intraepoch, IMO
             #if (batch_no*batch_size) % tp["intraepoch_val_every"] < batch_size:
             #    print("Intra Epoch Validation at Epoch", epoch, "Batch", batch_no)
