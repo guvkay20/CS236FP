@@ -195,7 +195,7 @@ class RNADiffuser(nn.Module):
                 #print("Current Noise Level:", noise_level)
                 step_size = self.baseStepSize * (noise_level**2) / (self.noiseLevels[-1]**2)                
                 for t in range(stepsAtNL):
-                    print(torch.cuda.memory_summary())
+                    #print(torch.cuda.memory_summary())
                     pbar.update(1)
                     ds = self.computeDVectors_(R, molGraphs) 
                     scores = self.forward(molGraphs, ds)

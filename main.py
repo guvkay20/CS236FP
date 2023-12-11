@@ -306,8 +306,10 @@ def customLoader(valDS, factor, canSort):
     ibatches.append(ibatch)
     return batches
 
+
+
 # NOTE use_ratio is deprecated; only changes recording
-def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
+def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25, savestr=""): # If log, specify st
     #dataloader = torch.utils.data.DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x:x)
     #pdb.set_trace()
     dataloader = customLoader(validation_dataset, factor=0.18,#0.09, TODO
@@ -319,7 +321,7 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
 
         losses = []
         for batch_no, batch in enumerate(tqdm(dataloader, desc='Validating')):#, total=goFor)):
-            print(torch.cuda.memory_summary())
+            #print(torch.cuda.memory_summary())
             print([len(x) for x,y,z,q in batch])
             #if batch_no == goFor:
             #    break
@@ -369,7 +371,7 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
                 coords_hats = predictCoords(model, Xs, pred_stepsAtNL)
                 for X, coord_hat in zip(Xs, coords_hats):
                     X.predCoords = coord_hat
-                    structureCode = str(random.randint(10000000,99999999))
+                    structureCode = str(random.randint(100000000,999999999))
                     torch.save(X, "predictions/predicted_structure_"+structureCode)
                     with open("predicthistory", "a") as f:
                         f.write(structureCode + " : " + str(X.seq) + "\n")
@@ -379,21 +381,147 @@ def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=No
             print(rmsds)
             avg_rmsd = sum(rmsds)/len(rmsds) 
             print("Average Validation RMSD", avg_rmsd)
-        
+            with open("rmsd_test_res.csv","a") as f:
+                f.write(savestr+","+str(avg_loss.item())+","+(",".join([str(rmsd.item()) for rmsd in rmsds])))
+                f.write("\n")
     model.train()
         
 def test(model, test_dataset, batch_size, device):
     pass # TODO loss, RMSD; just like validate but use_ratio = 1.0
 
+
+def validate_rmsds(model, ds, r_fxn, epsilon, savestr, ratio=1.0, device='cuda', pred_stepsAtNL=10):
+    model.eval()
+
+    ratio = model.hyper["noise_level_ratio"]
+    nls = [model.hyper["noise_level_max"]]
+    while nls[-1] > model.hyper["noise_level_min"]:
+        nls.append(nls[-1] / ratio)
+    model.noiseLevels = nls[:-1]
+    model.initialDeviation = r_fxn(model.hyper["noise_level_max"])
+    model.baseStepSize = epsilon
+
+    #ds = ds[:int(len(ds)*ratio)]
+    rmsdDL = customLoader(ds, factor=0.20,#0.12,#0.20,#TODO 0.10,
+                                    canSort=True)
+    rmsds = []
+    #for batch_no, batch in enumerate(tqdm(rmsdDL, desc=f"Validating RMSD")):#, total=goFor)):            
+    for batch in rmsdDL:
+        Xs = list()
+        for (x,y,z,q) in batch:
+            y = y.to(device)
+            z = z.to(device)
+            X = MolGraph(device)
+            X.atoms = x
+            X.adjList = z
+            X.coords = y
+            X.seq = q
+            X.generateIndices()
+            Xs.append(X)
+
+        coords_hats = predictCoords(model, Xs, pred_stepsAtNL)
+        for X, coord_hat in zip(Xs, coords_hats):
+            X.predCoords = coord_hat
+            structureCode = str(random.randint(100000000,999999999))
+            torch.save(X, "predictions/predicted_structure_"+structureCode)
+            with open("predicthistory", "a") as f:
+                f.write(structureCode + " : " + str(X.seq) + "\n")
+            _rmsd = RMSD(coord_hat, X.coords)
+            rmsds.append(_rmsd)
+            print(_rmsd)
+        break # NOTE only run the first iteration
+    
+    avg_rmsd = sum(rmsds)/len(rmsds) 
+    print("Average Validation RMSD", avg_rmsd)
+    with open("rmsd_res.csv","a") as f:
+        f.write(savestr+","+(",".join([str(rmsd.item()) for rmsd in rmsds])))
+        f.write("\n")
+
+def hyper_rmsd(ds):
+    # Load list of models to load
+    modelpaths = []
+    with open("rmsdhypermodels") as f:
+        line = f.readline()
+        while line:
+            modelpaths.append(line.strip())
+            line = f.readline()
+   
+    # Load those models hparams
+    hypers = dict()
+    with open("trainhistory") as f:
+        line = f.readline()
+        while line:
+            modelkey = ":".join(line.split(":")[0:3]).strip()
+            hyperlist = ":".join(line.split(":")[3:]).strip()[1:-1].split(",")
+            hyperpairs = [pair.strip().split(":") for pair in hyperlist]
+            hyperpairs = [(keystr.strip()[1:-1], int(valstr) if valstr.strip().isnumeric() else float(valstr)) for keystr,valstr in hyperpairs]
+            hyperpairs = {k:v for k,v in hyperpairs}
+            hypers[modelkey] = hyperpairs
+            line = f.readline()
+
+    for modelpath in modelpaths:
+        for r in range(1):#range(2):
+            for eps in [3e-5]:#[3e-5,1e-4,3e-4]:
+                rfxn = lambda x:x/2#[lambda x:x/2][r]:#[lambda x:x,lambda x:x/2][r]
+                
+                model = RNADiffuser(hypers["_".join(modelpath.split("_")[2:])], 'cuda')
+                model.load_state_dict(torch.load(modelpath))
+                model.to('cuda')
+
+                validate_rmsds(model, ds, rfxn,eps,modelpath+" rchoice:"+str(2+r)+" eps:"+str(eps),pred_stepsAtNL=5) # DEBUG steps
+
+def hyper_test(ds):
+    # Load list of models to load
+    modelpaths = []
+    with open("testmodels") as f:
+        line = f.readline()
+        while line:
+            modelpaths.append(line.strip())
+            line = f.readline()
+   
+    # Load those models hparams
+    hypers = dict()
+    with open("trainhistory") as f:
+        line = f.readline()
+        while line:
+            modelkey = ":".join(line.split(":")[0:3]).strip()
+            hyperlist = ":".join(line.split(":")[3:]).strip()[1:-1].split(",")
+            hyperpairs = [pair.strip().split(":") for pair in hyperlist]
+            hyperpairs = [(keystr.strip()[1:-1], int(valstr) if valstr.strip().isnumeric() else float(valstr)) for keystr,valstr in hyperpairs]
+            hyperpairs = {k:v for k,v in hyperpairs}
+            hypers[modelkey] = hyperpairs
+            line = f.readline()
+
+    for modelpath in tqdm(modelpaths):
+        for r in [lambda x:x]:#range(2):
+            for eps in [3e-5]:#[3e-5,1e-4,3e-4]:
+                rfxn = lambda x:x/2#[lambda x:x/2][r]:#[lambda x:x,lambda x:x/2][r]
+                
+                model = RNADiffuser(hypers["_".join(modelpath.split("_")[2:])], 'cuda')
+                model.load_state_dict(torch.load(modelpath))
+                model.to('cuda')
+                
+                model.initialDeviation = rfxn(model.hyper["noise_level_max"])
+                model.baseStepSize = eps
+                #validate_rmsds(model, ds, rfxn,eps,modelpath+" rchoice:"+str(2+r)+" eps:"+str(eps),pred_stepsAtNL=5) # DEBUG steps
+                
+                validate(tp, model, ds, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = 25, savestr=modelpath+" eps=3e-4 r=R/s")
+
+
     
 
+#def validate(tp, model, validation_dataset, use_ratio, batch_size, device, sw=None, st=-1, useRMSD = False, log=True, pred_stepsAtNL=25): # If log, specify st
+
 def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is torch dataset
-        device, batch_size, num_epochs, loaded_model_from_checkpoint=False):
+        device, batch_size, num_epochs, loaded_model_from_checkpoint=False, from_epoch=0):
     
-    trainCode = str(datetime.now()).replace(" ","_")#random.randint(100000,999999)
-    print("Training Code", trainCode)
-    with open("trainhistory","a") as f:
-        f.write(trainCode + " : " + str(hyper) + "\n")
+    if loaded_model_from_checkpoint:
+        trainCode = tp["trainCode"]
+    else:
+        trainCode = str(datetime.now()).replace(" ","_")#random.randint(100000,999999)
+        print("Training Code", trainCode)
+        with open("trainhistory","a") as f:
+            f.write(trainCode + " : " + str(hyper) + "\n")
     sw = tensorboard.SummaryWriter(log_dir="logs/"+str(trainCode)+"/")
 
     model.to(device)
@@ -411,9 +539,12 @@ def train(hyper, tp, model, training_dataset, validation_dataset, # dataset is t
     optimizer = torch.optim.AdamW(model.parameters(), lr=hyper["lr"])
     loss = torch.tensor([1.0])
 
-    validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, 0)
-    overallcount = 0
-    for epoch in range(num_epochs):
+    if not loaded_model_from_checkpoint:
+        validate(tp, model, validation_dataset, 1.0, batch_size, device, sw, 0)
+        overallcount = 0
+    else:
+        overallcount = tp["last_batch_count"]
+    for epoch in range(from_epoch,num_epochs):
         #dataloader = torch.utils.data.DataLoader(training_dataset, batch_size = batch_size, shuffle=True, collate_fn=lambda x: x )
         dataloader = customLoader(training_dataset, factor=0.44,#0.22, TODO
                 canSort=False)
@@ -471,6 +602,18 @@ def DSstat(train, valid, test):
         return " ".join(res)
     stats.append(Stat("Distribution",distribution))
 
+    def lens(ds):
+        #numBucks = 100
+        #dt = [0 for _ in range(numBucks)]
+        ls = []
+        for item in ds:
+            ls.append(len(item[0]))
+        res = [str(it) for it in ls]
+        return " ".join(res)
+    stats.append(Stat("Lengths",lens))
+
+
+
     for stat in stats:
         print("Train " + stat.name + ": " + str(stat.apply(train)))
         print("Validation " + stat.name + ": " + str(stat.apply(valid)))
@@ -483,7 +626,7 @@ def defaultTPs():
     return {
         "intraepoch_val_ratio":0.2,
         "intraepoch_val_every":80,
-        "predict_steps_per_NL":10,
+        "predict_steps_per_NL":25,#10,
         "mode_val_ratio":1.0,
         "val_batchsize":4,
         "predict_batchsize":6,
@@ -491,19 +634,19 @@ def defaultTPs():
 
 def defaultHypers():
     return {
-        "mgin_conv_inlevel_layers":2,
-        "mgin_conv_outlevel_layers":1,
-        "mgin_layers":10,
+        "mgin_conv_inlevel_layers":2,#1,
+        "mgin_conv_outlevel_layers":1,#2,
+        "mgin_layers":3,
         "noise_level_min":0.5,
         "noise_level_ratio":1.1,
         "noise_level_max":40.0,
-        "embed_dims":3,
+        "embed_dims":3,#4,
         "num_epochs":30,
-        "mlp_in_layers":2,
-        "mlp_mid_layers":2,
-        "base_step_size": 2e-5,
+        "mlp_in_layers":2,#1,
+        "mlp_mid_layers":2,#4,
+        "base_step_size": 3e-5,#2e-5,
         "gen_initial_std":40.0,
-        "lr":1e-3,
+        "lr":3e-4,
         "train_batchsize":2
     }
 
@@ -519,21 +662,22 @@ def hp_search(trainDS, validDS, device):
     #  fewer epochs
     
     hyperranges = {
-        #"mgin_conv_inlevel_layers":[1,4],
+        #"mgin_conv_inlevel_layers":[4],#[1,4],
         #"mgin_conv_outlevel_layers":[2,4],
-        #"mgin_layers":[5,15],
+        #"mgin_layers":[3,7],
         #"noise_level_min":0.5, 
-        #"noise_level_ratio":[1.3,1.5],
-        #"noise_level_max":[20.0,60.0],
-        "embed_dims":[2,4,6],
+        "noise_level_ratio":[1.3,1.5],
+        "noise_level_max":[20.0,60.0],
+        #"embed_dims":[2,4,6],
         #"num_epochs":30,
-        "mlp_in_layers":[1,4],
-        "mlp_mid_layers":[1,4],
+        #"mlp_in_layers":[1],
+        #"mlp_mid_layers":[6],
         #"base_step_size": 2e-5,
         #"gen_initial_std":40.0,
-        #"lr":1e-3,
+        #"lr":[1e-3,3e-4]#[1e-4,3e-3,1e-3],
         #"train_batchsize":2
     }
+    
 
 
 
@@ -556,7 +700,7 @@ def hp_search(trainDS, validDS, device):
         for v in r:
             hyper = defaultHypers()
             hyper[k] = v
-            hyper["num_epochs"] = 10
+            hyper["num_epochs"] = 20
             hypers.append(hyper)
 
     #pdb.set_trace()
@@ -607,10 +751,20 @@ if __name__ == "__main__":
     elif args.mode =="hp_search":
         hp_search(trainDS, validDS, device)
         quit()
-
+    elif args.mode =="hp_gen":
+        hyper_rmsd(validDS)
+        quit()
 
     hyper = defaultHypers()
     tp = defaultTPs()
+
+    if args.mode=="conttrain":
+        # TODO add hypers
+        hyper["num_epochs"] = 20
+        tp["from_epoch"] = 10 #TODO
+        hyper["noise_level_ratio"] =  1.1
+        tp["trainCode"] = "2023-11-30_18:38:13.038836" #TODO
+        tp["last_batch_count"] = 512 # TODO
 
     model = RNADiffuser(hyper, device)
     loaded = False
@@ -618,8 +772,10 @@ if __name__ == "__main__":
         loaded = True
         model.load_state_dict(torch.load(args.model_path))
     model.to(device)
-   
-    if args.mode=="train":
+
+    if args.mode=="conttrain":
+        train(hyper, tp, model, trainDS, validDS, device, hyper["train_batchsize"], hyper["num_epochs"], True, from_epoch=tp["from_epoch"])
+    elif args.mode=="train":
         train(hyper, tp, model, trainDS, validDS, device, hyper["train_batchsize"], hyper["num_epochs"], loaded) #TODO if loaded, add random # and last epoch option to continue train smoothly
     elif args.mode=="validate":
         validate(tp, model, validDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = tp["predict_steps_per_NL"]) # TODO 0.1 is a joke but required for rmsd realistic runtime
@@ -627,8 +783,9 @@ if __name__ == "__main__":
         #print("RMSD",RMSD(predictCoords(model, recon(validDS[0], device), 1), validDS[0][1]))       # Currently set to debug prediction, TODO include sequence reconstruction
         print("RMSD",RMSD(torch.randn_like(validDS[0][1]).to(device), validDS[0][1]))
     elif args.mode=="test":
-        print("Testing not implemented")
-        raise Exception
+        hyper_test(testDS)
+        #validate(tp, model, testDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = 25)
+        #validate(tp, model, testDS, tp["mode_val_ratio"], tp["val_batchsize"], device, useRMSD = True, log=False, pred_stepsAtNL = tp["predict_steps_per_NL"]) # TODO 0.1 is a joke but required for rmsd realistic runtime
     else:
         print("ERROR: Mode argument not found in options")
         assert(False)
